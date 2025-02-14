@@ -33,7 +33,9 @@ destroy (xmms_object_t *obj)
 	xmms_xform_plugin_t *plugin = (xmms_xform_plugin_t *) obj;
 
 	g_list_free_full (plugin->in_types, xmms_object_unref);
-	xmms_object_unref (plugin->default_out_type);
+	if (plugin->default_out_type) {
+		xmms_object_unref (plugin->default_out_type);
+	}
 
 	if (plugin->metadata_mapper != NULL) {
 		g_hash_table_unref (plugin->metadata_mapper);
@@ -155,6 +157,49 @@ xmms_xform_plugin_supports (const xmms_xform_plugin_t *plugin, const xmms_stream
 	}
 
 	return FALSE;
+}
+
+/* Returns TRUE if the given plugin is an effect plugin, and is thus not
+   required when building a chain.  These plugins are omitted entirely from
+   chain building, and are instead added to the end of complete chains in the
+   order given by the user prefs. */
+gboolean
+xmms_xform_plugin_is_effect (const xmms_xform_plugin_t *plugin)
+{
+	GList *t;
+
+	g_return_val_if_fail (plugin, FALSE);
+
+	for (t = plugin->in_types; t; t = g_list_next (t)) {
+		const gchar *mime;
+
+		mime = xmms_stream_type_get_str (t->data, XMMS_STREAM_TYPE_MIMETYPE);
+
+		/* Any plugin taking in audio/pcm data is considered an effect */
+		if (strcmp (mime, "audio/pcm") == 0) {
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* Returns TRUE if the given plugin is required to build certain chains, and
+   without the plugin the chain could not be built.
+   Currently only the sample converter plugin is here, as this is the only
+   effect plugin required to build some chains (particularly those formats like
+   FLAC that produce samples often not directly supported by an output plugin. */
+gboolean
+xmms_xform_plugin_is_chain_support_effect (const xmms_xform_plugin_t *plugin)
+{
+	const char *plugin_name;
+
+	g_return_val_if_fail (plugin, FALSE);
+
+	plugin_name = xmms_plugin_shortname_get ((const xmms_plugin_t *)plugin);
+
+	return
+		(strcmp (plugin_name, "converter") == 0)
+	;
 }
 
 void

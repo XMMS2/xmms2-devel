@@ -83,8 +83,10 @@ typedef struct xmms_xform_hotspot_St {
 #define READ_CHUNK 4096
 
 
+static gboolean xmms_xform_match (xmms_plugin_t *plugin, gpointer user_data);
 xmms_xform_t *xmms_xform_find (xmms_xform_t *prev, xmms_medialib_entry_t entry,
-                               GList *goal_hints);
+                               GList *goal_hints, gboolean want_chain);
+static gboolean has_goalformat (xmms_xform_t *xform, GList *goal_formats);
 const char *xmms_xform_shortname (xmms_xform_t *xform);
 static xmms_xform_t *add_effects (xmms_xform_t *last,
                                   xmms_medialib_entry_t entry,
@@ -288,7 +290,7 @@ xmms_xform_browse (const gchar *url, xmms_error_t *error)
 	                             durl,
 	                             XMMS_STREAM_TYPE_END);
 
-	xform2 = xmms_xform_find (xform, 0, NULL);
+	xform2 = xmms_xform_find (xform, 0, NULL, FALSE);
 	if (xform2) {
 		XMMS_DBG ("found xform %s", xmms_xform_shortname (xform2));
 	} else {
@@ -1106,66 +1108,430 @@ xmms_xform_get_url (xmms_xform_t *xform)
 	return url;
 }
 
-
+/* State information for outer loop */
 typedef struct match_state_St {
-	xmms_xform_plugin_t *match;
 	const xmms_stream_type_t *out_type;
-	gint priority;
+	xmms_xform_t *final_xform; /* Goal xform if found */
+	gint final_xform_priority; /* Priority of goal xform */
+	xmms_xform_t *prev_xform;  /* Parent xform in the chain we are building */
+	gint prev_xform_priority;  /* Parent xform's priority */
+	xmms_medialib_entry_t entry;
+	GList *goal_hints;
+	const gchar *chain_title;  /* Name of partial xform chain being built */
+	gint depth;                /* Maximum recursion depth */
+	gboolean want_chain;       /* FALSE to get just one xform, not a full chain */
 } match_state_t;
+
+/* State information for inner loop */
+typedef struct match_substate_St {
+	match_state_t *state;
+	gint largest_priority; /* Largest priority found so far, within the limit */
+	gint limit_priority;   /* Looking for plugins at or below this priority */
+	gint index;            /* Current index within the loop of all plugins */
+	gint start;            /* Number of plugins to skip at loop start */
+	gboolean matched;      /* TRUE if an xform matched in this loop */
+} match_substate_t;
+
+
+static gboolean
+xmms_xform_submatch (xmms_plugin_t *plugin, gpointer user_data)
+{
+	xmms_xform_plugin_t *xform_plugin = (xmms_xform_plugin_t *) plugin;
+	match_substate_t *substate = (match_substate_t *) user_data;
+	gint this_priority = 0;
+	xmms_xform_t *xform_test;
+	const char *plugin_name, *out_type_str;
+
+	g_assert (plugin->type == XMMS_PLUGIN_TYPE_XFORM);
+
+	/* Skip the first few items if we're nesting a search in the middle of the
+	   plugin list */
+	substate->index++;
+	if (substate->start > substate->index) return TRUE;
+
+/*
+	XMMS_DBG ("[chain %s] Trying plugin '%s'",
+	          substate->state->chain_title,
+	          xmms_plugin_shortname_get (plugin));
+*/
+	if (!xmms_xform_plugin_supports (xform_plugin, substate->state->out_type, &this_priority)) {
+		return TRUE;
+	}
+
+	plugin_name = xmms_plugin_shortname_get (plugin);
+
+	if (this_priority == 0) {
+		XMMS_DBG ("[chain %s] Plugin '%s' ignored (priority is 0)",
+		          substate->state->chain_title,
+		          plugin_name);
+		return TRUE;
+	}
+
+	/* See if this plugin already appears in this chain */
+	/* Can't do this because MP3 files first match magic:id3v2 then magic:mad
+	xmms_xform_t *p = substate->state->prev_xform;
+	while (p) {
+		if (p->plugin) {
+			const char *prev_name = xmms_plugin_shortname_get ((xmms_plugin_t *) p->plugin);
+			if (strcmp(prev_name, plugin_name) == 0) {
+				XMMS_DBG ("[chain %s] Skipping plugin '%s' as it's already in the chain",
+				          substate->state->chain_title,
+				          plugin_name);
+				return TRUE;
+			}
+		}
+		p = p->prev;
+	}
+	*/
+
+	if (
+		xmms_xform_plugin_is_effect (xform_plugin)
+		&& !xmms_xform_plugin_is_chain_support_effect (xform_plugin)
+	) {
+		/* Effect plugins aren't needed to build a chain, they get added in the
+		   user's preferred order once the chain has been built */
+		XMMS_DBG ("[chain %s] Skipping effect plugin '%s'",
+			          substate->state->chain_title,
+			          plugin_name);
+		return TRUE;
+	}
+
+	/* Note that the following check only defers priorities *lower than* the
+	   current plugin.  Those that are *equal* priority to the current plugin
+	   will be treated the same as if they were higher priority.  This is a
+	   required part of the algorithm, as it ensures that if a plugin cannot
+	   handle a file for some reason, other plugins of the *same priority* will
+	   also be tried before falling back to lower priority ones. */
+	if (this_priority < substate->largest_priority) {
+		/* The priority is too low to use in this run.  This function will be
+		   called again later with a lower "largest priority" so we'll be checking
+		   this plugin then. */
+		XMMS_DBG ("[chain %s] Plugin '%s' deferred (priority %d too low)",
+		          substate->state->chain_title,
+		          plugin_name,
+		          this_priority);
+		return TRUE;
+	}
+
+	if (this_priority > substate->limit_priority) {
+		/* Priority too high (which means we already checked this plugin in a
+		   recursive call to this function that ran earlier.) */
+		XMMS_DBG ("[chain %s] Plugin '%s' ignored (already tried earlier)",
+		          substate->state->chain_title,
+		          plugin_name,
+		          this_priority);
+		return TRUE;
+	}
+
+	/* This is the largest priority value we've seen this run, so keep searching
+	   for equal or higher priorities, but in a nested loop. */
+	substate->largest_priority = this_priority;
+
+	match_substate_t rec;
+	rec.state = substate->state;
+	rec.largest_priority = substate->largest_priority + 1;
+	rec.limit_priority = substate->limit_priority;
+	rec.index = 0;
+	rec.start = substate->index + 1;
+	rec.matched = FALSE;
+
+	XMMS_DBG ("[chain %s] Plugin '%s' matched (priority %d) but will check for "
+	          "other priority %d..%d plugins first",
+	          substate->state->chain_title,
+	          plugin_name,
+	          this_priority,
+	          substate->largest_priority,
+	          substate->limit_priority);
+
+	/* Search the next plugin onwards for any higher priority ones */
+	xmms_plugin_foreach (XMMS_PLUGIN_TYPE_XFORM, xmms_xform_submatch, &rec);
+
+	/* If we just handled a plugin with a preferred priority (>100) don't process
+	   any further plugins */
+	if (rec.matched && (rec.largest_priority > 100)) {
+		XMMS_DBG ("Was going to check '%s' but already found >100 priority so "
+		          "discontinuing search",
+		          plugin_name);
+		return FALSE;
+	}
+
+	/* At this point we have tested the rest of the plugins for anything that's
+	   higher priority than us, which means the only plugins left in the list
+	   are those that are lower or equal priority to us.  So we limit ourselves
+	   to only looking at the same priority level as this plugin for the rest of
+	   the loop.  The lower priority plugins will be checked in the next loop. */
+	substate->limit_priority = this_priority;
+
+	out_type_str = xmms_stream_type_get_str(substate->state->out_type,
+	                                        XMMS_STREAM_TYPE_MIMETYPE);
+	XMMS_DBG ("[chain %s] No higher priority plugins found for '%s', going "
+	          "with '%s'",
+	          substate->state->chain_title,
+	          out_type_str,
+	          plugin_name);
+
+	/* Seek back to the start of the file we're checking, otherwise if one plugin
+	   reads some data, the next plugin won't see the beginning of the file.
+	 */
+	xmms_error_t err;
+	if (substate->state->prev_xform && substate->state->prev_xform->plugin) {
+		/* Move any auxdata from hotspots into privdata.  If we don't do this the
+		   auxdata will be lost when the hotspots are cleared during the seek. */
+		xmms_xform_hotspots_update (substate->state->prev_xform);
+
+		xmms_xform_this_seek(substate->state->prev_xform, 0, XMMS_XFORM_SEEK_SET, &err);
+	}
+
+	/* Init this xform and see if it can handle this format */
+	xform_test = xmms_xform_new (xform_plugin,
+		substate->state->prev_xform, substate->state->prev_xform->medialib,
+		substate->state->entry, substate->state->goal_hints);
+
+	/* If this is a chain support plugin (like 'converter') then it typically
+	   comes last in the chain, but we want to use the priority of the xform
+	   actually handling the file format.  So for any chain support plugins, we
+	   respect the priority when ordering the xforms but when we move on to build
+	   the next chain segment (or accept this chain as a goal), we use the
+	   priority of the previous (non-chain-support) xform. */
+	if (xmms_xform_plugin_is_chain_support_effect (xform_plugin)) {
+		this_priority = substate->state->prev_xform_priority;
+		XMMS_DBG("Using prev xform priority of %d as '%s' is a chain support plugin",
+		         this_priority,
+		         plugin_name);
+	}
+
+	if (xform_test) {
+		/* Got an xform that can handle this format */
+		substate->matched = TRUE;
+
+		if (!substate->state->want_chain) {
+			/* Only a single xform is wanted, so don't build a whole chain */
+			substate->state->final_xform = xform_test;
+			substate->state->final_xform_priority = this_priority;
+			return FALSE;
+		}
+
+		if (!has_goalformat (xform_test, substate->state->goal_hints)) {
+			GString *chain_title;
+			match_state_t nextState;
+
+			/* Found an xform but it's not the final one, build a chain */
+			XMMS_DBG ("[chain %s] Success with '%s', but non-goal so building xform "
+			          "chain upon this",
+			          substate->state->chain_title,
+			          plugin_name);
+
+			if (substate->state->depth > 20) {
+				/* Make sure we don't ever get stuck in endless recursion */
+				xmms_log_error ("Chain length of %d too long, aborting",
+				                substate->state->depth);
+				return TRUE;
+			}
+
+			/* Build the partial chain string for debug messages */
+			chain_title = g_string_new (substate->state->chain_title);
+			g_string_append (chain_title, plugin_name);
+			g_string_append_c (chain_title, ':');
+
+			/* Now recurse and start the whole process again, this time with a new
+			   independent 'state' variable.  We do much the same as happens in
+			   xmms_xform_find() except here we carry across some of the state. */
+			nextState.out_type = xmms_xform_get_out_stream_type (xform_test);
+			nextState.final_xform_priority = substate->state->final_xform_priority;
+			nextState.final_xform = NULL;
+			nextState.prev_xform = xform_test;
+			nextState.prev_xform_priority = this_priority;
+			nextState.entry = substate->state->entry;
+			nextState.goal_hints = substate->state->goal_hints;
+			nextState.chain_title = chain_title->str;
+			nextState.depth = substate->state->depth + 1;
+			nextState.want_chain = substate->state->want_chain;
+
+			xmms_xform_match(NULL, &nextState);
+
+			g_string_free (chain_title, TRUE);
+
+			if (nextState.final_xform) {
+				/* Got a goal chain of sufficient priority */
+				if (substate->state->final_xform) {
+					XMMS_DBG ("[chain %s] Releasing previous chain %s",
+					          substate->state->chain_title,
+					          xmms_plugin_shortname_get ((xmms_plugin_t *) substate->state->final_xform->plugin));
+					xmms_object_unref (substate->state->final_xform);
+				}
+				substate->state->final_xform = nextState.final_xform;
+				substate->state->final_xform_priority = nextState.final_xform_priority;
+			}
+			xmms_object_unref (xform_test);
+
+			/* At this point the below 'else' condition will have already executed
+			   during recursion for the goal class if there is one, or NULL will be
+			   returned and we have to keep searching.  So either way we don't need
+			   to do anything further here. */
+		} else {
+			/* Got a goal format, this is now a fully usable xform chain */
+			xmms_log_info ("Got full chain as '%s%s' (final priority %d for '%s')",
+			          substate->state->chain_title,
+			          plugin_name,
+			          this_priority,
+			          out_type_str);
+			if (this_priority > substate->state->final_xform_priority) {
+				/* This final xform is higher priority than the final xform on the
+				   current chain, so replace that with this one. */
+				XMMS_DBG ("[chain %s%s] New chain is highest priority yet (%d > %d), "
+				          "keeping but continuing search",
+				          substate->state->chain_title,
+				          plugin_name,
+				          this_priority,
+				          substate->state->final_xform_priority);
+				if (substate->state->final_xform) {
+					/* This will only happen if there are two xform plugins at the same
+					   point in the chain, both of which offer goal formats (e.g. two
+					   different plugins set up to match the same 'magic' string with the
+					   same MIME type.) */
+					XMMS_DBG ("[chain %s%s] Releasing previous goal xform %s",
+					          substate->state->chain_title,
+					          plugin_name,
+					          xmms_plugin_shortname_get ((xmms_plugin_t *) substate->state->final_xform->plugin));
+					xmms_object_unref (substate->state->final_xform);
+				}
+				substate->state->final_xform = xform_test;
+				substate->state->final_xform_priority = this_priority;
+			} else {
+				XMMS_DBG ("[chain %s%s] Not using new chain, priority (%d) isn't "
+				          "higher than existing chain (%d)",
+				          substate->state->chain_title,
+				          plugin_name,
+				          this_priority,
+				          substate->state->final_xform_priority);
+				xmms_object_unref (xform_test);
+			}
+		}
+		/* We have to keep searching here, otherwise any lower priority xforms
+		   will get skipped.  We need to check the lower priority xforms as well,
+		   because they might end up providing a high priority final xform that
+		   we should use.  This can happen when two different chains support the
+		   same file format, and it's the final xform priority that we should
+		   respect overall, rather than the priority of the individual xforms
+		   that make up the chain. */
+
+	} else {
+		/* At this point, no plugins could be found that can read the previous
+		   plugin's output, so there's nowhere to go with this chain. */
+		XMMS_DBG ("Dead end chain '%s%s', resuming search",
+		          substate->state->chain_title,
+		          plugin_name);
+	}
+
+	/* Check the next plugin in the list */
+	XMMS_DBG ("[chain %s] Resuming search after '%s', but only for priority == %d",
+	          substate->state->chain_title,
+	          plugin_name,
+	          substate->limit_priority);
+
+	return TRUE;
+}
 
 static gboolean
 xmms_xform_match (xmms_plugin_t *plugin, gpointer user_data)
 {
-	xmms_xform_plugin_t *xform_plugin = (xmms_xform_plugin_t *) plugin;
 	match_state_t *state = (match_state_t *) user_data;
-	gint priority = 0;
+	match_substate_t substate;
+	int initial_limit_priority;
+	const char *out_type_str;
 
-	g_assert (plugin->type == XMMS_PLUGIN_TYPE_XFORM);
-
-	XMMS_DBG ("Trying plugin '%s'", xmms_plugin_shortname_get (plugin));
-	if (!xmms_xform_plugin_supports (xform_plugin, state->out_type, &priority)) {
-		return TRUE;
+	if (state->out_type == NULL) {
+		xmms_log_error ("[chain %s] Asked to find xform for NULL target type",
+		                state->chain_title);
+		out_type_str = "<any>";
+	} else {
+		out_type_str = xmms_stream_type_get_str(state->out_type, XMMS_STREAM_TYPE_MIMETYPE);
 	}
 
-	XMMS_DBG ("Plugin '%s' matched (priority %d)",
-	          xmms_plugin_shortname_get (plugin), priority);
+	XMMS_DBG ("[chain %s] Looking for xform with priority >= %d, that can handle '%s'",
+	          state->chain_title,
+	          state->final_xform_priority,
+	          out_type_str);
 
-	if (priority > state->priority) {
-		if (state->match) {
-			xmms_plugin_t *previous_plugin = (xmms_plugin_t *) state->match;
-			XMMS_DBG ("Using plugin '%s' (priority %d) instead of '%s' (priority %d)",
-			          xmms_plugin_shortname_get (plugin), priority,
-			          xmms_plugin_shortname_get (previous_plugin),
-			          state->priority);
+	substate.state = state;
+	substate.limit_priority = 200;
+	do {
+
+		substate.largest_priority = 0;
+		substate.index = 0;
+		substate.start = 0;
+		substate.matched = FALSE;
+
+		initial_limit_priority = substate.limit_priority;
+		XMMS_DBG ("[chain %s] Searching all plugins for '%s' handler with "
+		          "priority <= %d",
+		          state->chain_title,
+		          out_type_str,
+		          initial_limit_priority);
+		xmms_plugin_foreach (XMMS_PLUGIN_TYPE_XFORM, xmms_xform_submatch, &substate);
+
+		XMMS_DBG ("[chain %s] Finished search for '%s' plugin with "
+		          "priority %d..%d%s",
+		          state->chain_title,
+		          out_type_str,
+		          substate.largest_priority,
+		          initial_limit_priority,
+		          substate.largest_priority > 0 ? "" : ", no matches");
+
+		/* If we just handled a plugin with a preferred priority (>100) don't try
+		   and further plugins (they will be lower priority anyway) */
+		if (substate.matched && (substate.largest_priority > 100)) {
+			XMMS_DBG ("[chain %s] Got a preferred plugin that can handle '%s', "
+			          "discontinuing search",
+			          state->chain_title,
+			          out_type_str);
+			return FALSE;
 		}
 
-		state->match = xform_plugin;
-		state->priority = priority;
-	}
+		/* If we checked at least one plugin this run, substate.largest_priority
+		   will have been changed.  So if this happens, run another loop through the
+		   plugins looking for anything lower priority. */
+		substate.limit_priority = substate.largest_priority - 1;
+	} while (substate.largest_priority > 0);
+
+	XMMS_DBG ("[chain %s] Finished looking for xform with priority >= %d, that can handle '%s'",
+	          state->chain_title,
+	          state->final_xform_priority,
+	          out_type_str);
 
 	return TRUE;
 }
 
 xmms_xform_t *
 xmms_xform_find (xmms_xform_t *prev, xmms_medialib_entry_t entry,
-                 GList *goal_hints)
+                 GList *goal_hints, gboolean want_chain)
 {
 	match_state_t state;
-	xmms_xform_t *xform = NULL;
 
 	state.out_type = xmms_xform_get_out_stream_type (prev);
-	state.match = NULL;
-	state.priority = -1;
+	state.final_xform = NULL;
+	state.final_xform_priority = 0;
+	state.prev_xform = prev;
+	state.prev_xform_priority = 0;
+	state.entry = entry;
+	state.goal_hints = goal_hints;
+	state.chain_title = "";
+	state.depth = 0;
+	state.want_chain = want_chain;
 
-	xmms_plugin_foreach (XMMS_PLUGIN_TYPE_XFORM, xmms_xform_match, &state);
+	xmms_xform_match(NULL, &state);
 
-	if (state.match) {
-		xform = xmms_xform_new (state.match, prev, prev->medialib, entry, goal_hints);
-	} else {
+	if (!state.final_xform) {
 		XMMS_DBG ("Found no matching plugin...");
+	} else {
+		/* Seek back to the start of the file, otherwise we may have lost the first
+		   few bytes if some plugins checked the file content after the chain we
+		   ended up selecting.
+		 */
+		xmms_error_t err;
+		xmms_xform_this_seek(state.final_xform, 0, XMMS_XFORM_SEEK_SET, &err);
 	}
-
-	return xform;
+	return state.final_xform;
 }
 
 gboolean
@@ -1193,7 +1559,6 @@ xmms_xform_goal_hints_get (xmms_xform_t *xform)
 {
 	return xform->goal_hints;
 }
-
 
 static gboolean
 has_goalformat (xmms_xform_t *xform, GList *goal_formats)
@@ -1302,26 +1667,20 @@ chain_setup (xmms_medialib_t *medialib, xmms_medialib_entry_t entry,
 
 
 	last = xform;
+	xform = xmms_xform_find (last, entry, goal_formats, TRUE);
+	xmms_object_unref (last);
+	if (!xform) {
+		xmms_log_error ("Couldn't set up chain for '%s' (%d)",
+		                durl, entry);
 
-	do {
-		xform = xmms_xform_find (last, entry, goal_formats);
-		if (!xform) {
-			xmms_log_error ("Couldn't set up chain for '%s' (%d)",
-			                durl, entry);
-			xmms_object_unref (last);
-			g_free (durl);
-
-			return NULL;
-		}
-		xmms_object_unref (last);
-		last = xform;
-	} while (!has_goalformat (xform, goal_formats));
-
+		g_free (durl);
+		return NULL;
+	}
 	g_free (durl);
 
-	outdata_type_metadata_collect (last);
+	outdata_type_metadata_collect (xform);
 
-	return last;
+	return xform;
 }
 
 static void
@@ -1337,7 +1696,7 @@ chain_finalize (xmms_medialib_session_t *session,
 
 	namestr = g_string_new ("");
 	xmms_xform_metadata_collect (session, xform, namestr, rehashing);
-	xmms_log_info ("Successfully setup chain for '%s' (%d) containing %s",
+	xmms_log_info ("Successfully set up chain for '%s' (%d) containing %s",
 	               durl, entry, namestr->str);
 
 	g_string_free (namestr, TRUE);

@@ -88,6 +88,7 @@ static gboolean xmms_fluidsynth_plugin_setup (xmms_xform_plugin_t *xform_plugin)
 static gboolean xmms_fluidsynth_init (xmms_xform_t *xform);
 static void xmms_fluidsynth_destroy (xmms_xform_t *xform);
 static gint xmms_fluidsynth_read (xmms_xform_t *xform, xmms_sample_t *buf, gint len, xmms_error_t *err);
+static gint64 xmms_fluidsynth_seek (xmms_xform_t *xform, gint64 samples, xmms_xform_seek_mode_t whence, xmms_error_t *err);
 static void xmms_fluidsynth_sf_config_changed (xmms_object_t *obj, xmmsv_t *_value, gpointer udata);
 static void xmms_fluidsynth_config_changed (xmms_object_t *obj, xmmsv_t *_value, gpointer udata);
 static void xmms_fluidsynth_skip_bytes (xmms_xform_t *xform, guint count);
@@ -126,6 +127,7 @@ xmms_fluidsynth_plugin_setup (xmms_xform_plugin_t *xform_plugin)
 	methods.init = xmms_fluidsynth_init;
 	methods.destroy = xmms_fluidsynth_destroy;
 	methods.read = xmms_fluidsynth_read;
+	methods.seek = xmms_fluidsynth_seek;
 
 	xmms_xform_plugin_methods_set (xform_plugin, &methods);
 
@@ -366,6 +368,22 @@ xmms_fluidsynth_read (xmms_xform_t *xform, xmms_sample_t *buf, gint len, xmms_er
 	);
 
 	return (status == FLUID_OK) ? len : 0;
+}
+
+static gint64
+xmms_fluidsynth_seek (xmms_xform_t *xform, gint64 samples,
+                  xmms_xform_seek_mode_t whence, xmms_error_t *err)
+{
+	g_return_val_if_fail (xform, FALSE);
+	g_return_val_if_fail (whence == XMMS_XFORM_SEEK_SET, -1);
+
+	if (samples == 0) {
+		/* Seek to start, we can do that */
+		xmms_xform_seek(xform, 0, XMMS_XFORM_SEEK_SET, err);
+		return 0;
+	}
+
+	return -1;
 }
 
 static void

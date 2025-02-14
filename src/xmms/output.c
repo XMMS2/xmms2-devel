@@ -1011,7 +1011,9 @@ xmms_output_format_set (xmms_output_t *output, xmms_stream_type_t *fmt)
 
 		ret = xmms_output_plugin_method_format_set (output->plugin, output, fmt);
 		if (ret) {
-			xmms_object_unref (output->format);
+			if (output->format) {
+				xmms_object_unref (output->format);
+			}
 			xmms_object_ref (fmt);
 			output->format = fmt;
 		}

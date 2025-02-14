@@ -234,7 +234,7 @@ xmms_browse_test_xform_plugin_setup (xmms_xform_plugin_t *xform_plugin)
 	xmms_xform_plugin_methods_set (xform_plugin, &methods);
 
 	xmms_xform_plugin_indata_add (xform_plugin,
-	                              XMMS_STREAM_TYPE_PRIORITY, 0,
+	                              XMMS_STREAM_TYPE_PRIORITY, 50,
 	                              XMMS_STREAM_TYPE_MIMETYPE, "application/x-url",
 	                              XMMS_STREAM_TYPE_URL, "file://*",
 	                              XMMS_STREAM_TYPE_END);
