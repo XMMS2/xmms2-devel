@@ -41,7 +41,7 @@ namespace Xmms
 			 *  @note The constructor should only initialize the
 			 *        mainloop, not start it!
 			 */
-			MainloopInterface( xmmsc_connection_t* conn ) :
+			MainloopInterface( xmmsc_connection_t*& conn ) :
 				running_( false ), conn_( conn ) { }
 
 			/** Destructor.  Should also stop the loop.
