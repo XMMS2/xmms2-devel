@@ -273,9 +273,18 @@ xmms_medialib_filter (xmms_medialib_session_t *session,
 	s4_condition_t *cond;
 	s4_fetchspec_t *spec;
 	s4_resultset_t *ret;
+	s4_cmp_mode_t cmp;
+
+	/* Case-sensitive keys */
+	if (strcmp (filter_key, XMMS_MEDIALIB_ENTRY_PROPERTY_URL) == 0) {
+		cmp = S4_CMP_BINARY;
+	} else {
+		/* Everything else is case-insensitive */
+		cmp = S4_CMP_CASELESS;
+	}
 
 	cond = s4_cond_new_filter (S4_FILTER_EQUAL, filter_key, filter_val,
-	                           sourcepref, S4_CMP_CASELESS, filter_flags);
+	                           sourcepref, cmp, filter_flags);
 
 	spec = s4_fetchspec_create ();
 	s4_fetchspec_add (spec, fetch_key, sourcepref, fetch_flags);
